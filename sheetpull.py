@@ -63,17 +63,17 @@ def getworkers(id):
     c.execute('select count(WorkerID ) from workers where WorkerID =?', (id,))
     return c.fetchone()[0]>0 
 
-def addworker():
+def addworker(ip):
     desid = str(uuid.uuid5(uuid.NAMESPACE_URL, str(random.random())+str(random.random())+str(random.random())))#random.randint(1, 100000)#(myr[-1][0])+1
-    c.execute('INSERT INTO "main"."workers"("WorkerID","CreatedTime","LastAliveTime") VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)', (desid,))
+    c.execute('INSERT INTO "main"."workers"("WorkerID","CreatedTime","LastAliveTime","LastAliveIP") VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)', (desid,ip))
     complete = True
     return desid
 
-def workeralive(id):
-    c.execute('UPDATE workers SET LastAliveTime=CURRENT_TIMESTAMP WHERE WorkerID=?', (str(id),))
+def workeralive(id, ip):
+    c.execute('UPDATE workers SET LastAliveTime=CURRENT_TIMESTAMP, LastAliveIP=? WHERE WorkerID=?', (ip, str(id),))
     return
 
-def assignBatch(id):
+def assignBatch(id, ip):
     randomkey = random.randint(1, 10000)
     #Mutex lock used to prevent different workers getting the same batch id
     with assignBatchLock:
@@ -82,7 +82,7 @@ def assignBatch(id):
         ans = c.fetchall()[0][0]
         if not ans:
             return "Fail", "Fail"
-        c.execute('UPDATE main SET BatchStatus=1, WorkerKey=?, RandomKey=?, AssignedTime=CURRENT_TIMESTAMP, BatchStatusUpdateTime=CURRENT_TIMESTAMP WHERE BatchID=?',(id,randomkey,ans,))
+        c.execute('UPDATE main SET BatchStatus=1, WorkerKey=?, RandomKey=?, AssignedTime=CURRENT_TIMESTAMP, BatchStatusUpdateTime=CURRENT_TIMESTAMP, BatchStatusUpdateIP=? WHERE BatchID=?',(id,randomkey,ip,ans))
     return ans, randomkey
 
 def addtolist(list, id, batch, randomkey, item):
@@ -104,20 +104,20 @@ def addtolist(list, id, batch, randomkey, item):
     #except:
     #    return 'Fail'
 
-def updatestatus(id, batch, randomkey, status):
+def updatestatus(id, batch, randomkey, status, ip):
     #try:
         numstatus = ['f', '', 'c'].index(status)
-        c.execute('UPDATE main SET BatchStatus=?, BatchStatusUpdateTime=CURRENT_TIMESTAMP WHERE BatchID=? AND RandomKey=? AND WorkerKey=?', (numstatus, str(batch),str(randomkey),str(id),))
+        c.execute('UPDATE main SET BatchStatus=?, BatchStatusUpdateTime=CURRENT_TIMESTAMP, BatchStatusUpdateIP=? WHERE BatchID=? AND RandomKey=? AND WorkerKey=?', (numstatus, str(batch), ip, str(randomkey),str(id),))
         return 'Success'
     #except:
     #    return 'Fail'
 
-def verifylegitrequest(id, batch, randomkey):
+def verifylegitrequest(id, batch, randomkey, ip):
     #try:
         c.execute('SELECT "_rowid_",* FROM main WHERE WorkerKey=? AND BatchID=? AND RandomKey=?', (str(id),str(batch),str(randomkey)))
         res = bool(c.fetchall())
         if res:
-            workeralive(id)
+            workeralive(id, ip)
         return res
     #except:
     #    return False
@@ -128,15 +128,17 @@ def reopenavailability():
 
 @app.route('/worker/getID')
 def give_id():
-    return str(addworker())
+    ip = request.headers['X-Forwarded-For']
+    return str(addworker(ip))
 
 @app.route('/worker/getBatch') #Parameters: id
 def give_batch():
     id = str(request.args.get('id', ''))
-    workeralive(id)
+    ip = request.headers['X-Forwarded-For']
+    workeralive(id, ip)
     if not getworkers(id):
         return 'Fail'
-    batchid, randomkey = assignBatch(id)
+    batchid, randomkey = assignBatch(id, ip)
     myj = {'batchID': batchid, 'randomKey': str(randomkey)}
     myresp = Response(json.dumps(myj), mimetype='application/json')
     return myresp
@@ -147,7 +149,8 @@ def submit_exclusion(): #Parameters: id, batchID, randomKey, exclusion
     batchid = request.args.get('batchID', '')
     randomkey = request.args.get('randomKey', '')
     target = request.args.get('exclusion', '')
-    if not verifylegitrequest(id, batchid, randomkey):
+    ip = request.headers['X-Forwarded-For']
+    if not verifylegitrequest(id, batchid, randomkey, ip):
         return 'Fail'
     if not target:
         return 'Fail'
@@ -159,7 +162,8 @@ def submit_deleted(): #Parameters: id, batchID, randomKey, deleted
     batchid = request.args.get('batchID', '')
     randomkey = request.args.get('randomKey', '')
     target = request.args.get('deleted', '')
-    if not verifylegitrequest(id, batchid, randomkey):
+    ip = request.headers['X-Forwarded-For']
+    if not verifylegitrequest(id, batchid, randomkey, ip):
         return 'Fail'
     if not target:
         return 'Fail'
@@ -171,7 +175,8 @@ def submit_private(): #Parameters: id, batchID, randomKey, private
     batchid = request.args.get('batchID', '')
     randomkey = request.args.get('randomKey', '')
     target = request.args.get('private', '')
-    if not verifylegitrequest(id, batchid, randomkey):
+    ip = request.headers['X-Forwarded-For']
+    if not verifylegitrequest(id, batchid, randomkey, ip):
         return 'Fail'
     if not target:
         return 'Fail'
@@ -183,12 +188,13 @@ def update_status(): #Parameters: id, batchID, randomKey, status ('a'=assigned,)
     batchid = request.args.get('batchID', '')
     randomkey = request.args.get('randomKey', '')
     status = request.args.get('status', '')
-    if not verifylegitrequest(id, batchid, randomkey):
+    ip = request.headers['X-Forwarded-For']
+    if not verifylegitrequest(id, batchid, randomkey, ip):
         return 'Fail'
     if not status in ['c', 'f']: #valid submission
         return 'Fail'
     else:
-        updatestatus(id, batchid, randomkey, status)
+        updatestatus(id, batchid, randomkey, status, ip)
         return 'Success'
 
 @app.route('/internal/dumpdb')
