@@ -105,12 +105,12 @@ def addtolist(list, id, batch, randomkey, item):
     #    return 'Fail'
 
 def updatestatus(id, batch, randomkey, status):
-    try:
+    #try:
         numstatus = ['f', '', 'c'].index(status)
         c.execute('UPDATE main SET BatchStatus=?, BatchStatusUpdateTime=CURRENT_TIMESTAMP WHERE BatchID=? AND RandomKey=? AND WorkerKey=?', (numstatus, str(batch),str(randomkey),str(id),))
         return 'Success'
-    except:
-        return 'Fail'
+    #except:
+    #    return 'Fail'
 
 def verifylegitrequest(id, batch, randomkey):
     #try:
