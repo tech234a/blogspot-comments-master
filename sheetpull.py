@@ -1,398 +1,210 @@
-import pickle, os, re, time, datetime, random, json, threading, requests, pydrive
-from googleapiclient.discovery import build
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
+import os, time, datetime, random, json, sqlite3, signal, uuid, requests, pydrive, flask, heroku3
 from time import sleep
-from hurry.filesize import size, alternative
 
 from pydrive.auth import GoogleAuth
 from pydrive.drive import GoogleDrive
 
-import flask
+from threading import Lock
+#Mutex lock used to prevent different workers getting the same batch id
+assignBatchLock = Lock()
+
+#AUTH to Google Drive
+gauth = GoogleAuth()
+
+gauth.LoadCredentialsFile("credentials.txt")
+if gauth.credentials is None:
+    gauth.LocalWebserverAuth()
+elif gauth.access_token_expired:
+    gauth.Refresh()
+else:
+    gauth.Authorize()
+
+gauth.SaveCredentialsFile("credentials.txt")
+
+drive = GoogleDrive(gauth)
+
+sleep(20) #Safety cushion
+
+#DL the DB
+mysf = drive.CreateFile({'id': str(heroku3.from_key(os.environ['heroku-key']).apps()['getblogspot-01'].config()['dbid'])})
+mysf.GetContentFile('db.db')
+del mysf
+
 from flask import Flask
 from flask import Response
 from flask import request
 app = Flask(__name__)
 
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-creds = None
-# The file token.pickle stores the user's access and refresh tokens, and is
-# created automatically when the authorization flow completes for the first
-# time.
-if os.path.exists('token.pickle'):
-    with open('token.pickle', 'rb') as token:
-        creds = pickle.load(token)
-# If there are no (valid) credentials available, let the user log in.
-if not creds or not creds.valid:
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    else:
-        flow = InstalledAppFlow.from_client_secrets_file(
-                'credentials.json', SCOPES)
-        creds = flow.run_local_server()
-    # Save the credentials for the next run
-    with open('token.pickle', 'wb') as token:
-        pickle.dump(creds, token)
+#DB Inititalization
+conn = sqlite3.connect('db.db')
+conn.isolation_level= None # turn on autocommit to increase concurency
+c = conn.cursor()
 
-service = build('sheets', 'v4', credentials=creds)
+#Graceful Shutdown
+class GracefulKiller:
+    kill_now = False
+    def __init__(self):
+        signal.signal(signal.SIGINT, self.exit_gracefully)
+        signal.signal(signal.SIGTERM, self.exit_gracefully)
 
-from pydrive.auth import GoogleAuth
-from pydrive.drive import GoogleDrive
+    def exit_gracefully(self,signum, frame):
+        self.kill_now = True
+        myul = drive.CreateFile({'title': 'db.db'})
+        sleep(5)
+        myul.SetContentFile('db.db')
+        myul.Upload()
+        heroku3.from_key(os.environ['heroku-key']).apps()['getblogspot-01'].config()['dbid'] = myul['id']
+        del myul
+        exit()
 
-MEM_SHEET_ID = os.environ['memsheetid']
-WORKER_SHEET_ID = os.environ['workersheetid']
+killer = GracefulKiller()
 
-def cooldown():
-    return random.randint(100, 150)
+def getworkers(id):
+    c.execute('select count(WorkerID ) from workers where WorkerID =?', (id,))
+    return c.fetchone()[0]>0 
 
-def getcell(cellloc):
-
-        # The ID and range of a sample spreadsheet.
-    #spreadsheet_id = MEM_SHEET_ID
-    #range_name = 'Sheet1!A1:A'
-
-    
-
-    # Call the Sheets API
-    # The ID of the spreadsheet to update.
-    spreadsheet_id = MEM_SHEET_ID  # TODO: Update placeholder value.
-
-    # The A1 notation of the values to update.
-    range_ = 'Sheet1!'+cellloc  # TODO: Update placeholder value.
-
-    # How the input data should be interpreted.
-    value_render_option = 'RAW'  # TODO: Update placeholder value.
-
-    request = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=range_) #, valueRenderOption=value_render_option, dateTimeRenderOption=date_time_render_option)
-    complete = False
-    while not complete:
-        try:
-            response = request.execute()
-            complete = True
-        except:
-            sleep(cooldown())
-    #print(response)
-    try:
-        finalresp = response['values'][0][0]
-    except:
-        finalresp = ''
-    return finalresp
-
-def getworkers():
-
-        # The ID and range of a sample spreadsheet.
-    #spreadsheet_id = WORKER_SHEET_ID
-    #range_name = 'Sheet1!A1:A'
-
-
-    
-
-    # Call the Sheets API
-    # The ID of the spreadsheet to update.
-    spreadsheet_id = WORKER_SHEET_ID  # TODO: Update placeholder value.
-
-    # The A1 notation of the values to update.
-    range_ = 'Sheet1!A:A'  # TODO: Update placeholder value.
-
-    # How the input data should be interpreted.
-    value_render_option = 'RAW'  # TODO: Update placeholder value.
-
-    request = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=range_, majorDimension='COLUMNS') #, valueRenderOption=value_render_option, dateTimeRenderOption=date_time_render_option, majorDimension='COLUMNS')
-    complete = False
-    while not complete:
-        try:
-            response = request.execute()
-            complete = True
-        except:
-            sleep(cooldown())
-    #print(response)
-    try:
-        finalresp = response['values'][0]
-    except:
-        finalresp = ''
-    return finalresp
-
-def addworker(id):
-    #mylist = [str(datetime.datetime.now()).split('.')[0]]
-    #mylist.extend(inlist)   
-    
-    # The ID and range of a sample spreadsheet.
-    spreadsheet_id = WORKER_SHEET_ID
-    range_name = 'Sheet1!A:A'
-    
-    # Call the Sheets API
-    values = [[id, str(datetime.datetime.now()).split('.')[0], str(datetime.datetime.now()).split('.')[0]]]
-    body = {
-            'values': values
-    }
-    request = service.spreadsheets().values().append(
-            spreadsheetId=spreadsheet_id, range=range_name,
-            valueInputOption="RAW", body=body)
-    #print(result['tableRange'])
-    
-    complete = False
-    while not complete:
-        try:
-            result = request.execute()
-            complete = True
-        except:
-            sleep(cooldown())
-    print('{0} cells appended.'.format(result \
-                                                                               .get('updates') \
-                                                                               .get('updatedCells')))
-    return result['updates']['updatedRange'].split(':')[-1][1:]
+def addworker():
+    desid = str(uuid.uuid5(uuid.NAMESPACE_URL, str(random.random())+str(random.random())+str(random.random())))#random.randint(1, 100000)#(myr[-1][0])+1
+    c.execute('INSERT INTO "main"."workers"("WorkerID","CreatedTime","LastAliveTime") VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)', (desid,))
+    complete = True
+    return desid
 
 def workeralive(id):
-    
-    # The ID and range of a sample spreadsheet.
-    #spreadsheet_id = MEM_SHEET_ID
-    #range_name = 'Sheet1!A1:A'
+    c.execute('UPDATE workers SET LastAliveTime=CURRENT_TIMESTAMP WHERE WorkerID=?', (str(id),))
+    return
 
-    # Call the Sheets API
-    # The ID of the spreadsheet to update.
-    spreadsheet_id = WORKER_SHEET_ID  # TODO: Update placeholder value.
-    
+def assignBatch(id):
+    randomkey = random.randint(1, 10000)
+    #Mutex lock used to prevent different workers getting the same batch id
+    with assignBatchLock:
+                          #only one thread can execute here
+        c.execute('SELECT BatchID from main where BatchStatus=0 LIMIT 1')
+        ans = c.fetchall()[0][0]
+        if not ans:
+            return "Fail", "Fail"
+        c.execute('UPDATE main SET BatchStatus=1, WorkerKey=?, RandomKey=?, AssignedTime=CURRENT_TIMESTAMP, BatchStatusUpdateTime=CURRENT_TIMESTAMP WHERE BatchID=?',(id,randomkey,ans,))
+    return ans, randomkey
+
+def addtolist(list, id, batch, randomkey, item):
+    #try:
+    item = item.lower()
+    c.execute('SELECT '+str(list)+' FROM main WHERE BatchID=?', (str(batch),))
+    res = c.fetchall()[0][0]
+    splitter = ','
+    if not res:
+        splitter = ''
+    if res:
+        if str(item) in str(res).split(','):
+            return 'Fail'
+        splitter = str(res) + ','
+    if list == 'Excluded':
+        c.execute('INSERT into exclusions ("ExclusionName", "BatchStatus", "BatchStatusUpdateTime") VALUES (?, 0, CURRENT_TIMESTAMP)', (str(item),))
+    c.execute('UPDATE main SET "'+str(list)+'"=? WHERE BatchID=?', ((str(splitter)+str(item)), str(batch)))
+    return 'Success'
+    #except:
+    #    return 'Fail'
+
+def updatestatus(id, batch, randomkey, status):
     try:
-        cellloc = 'C'+str(getworkers().index(id)+1)
+        numstatus = ['f', '', 'c'].index(status)
+        c.execute('UPDATE main SET BatchStatus=?, BatchStatusUpdateTime=CURRENT_TIMESTAMP WHERE BatchID=? AND RandomKey=? AND WorkerKey=?', (numstatus, str(batch),str(randomkey),str(id),))
+        return 'Success'
     except:
-        sleep(5)
-        cellloc = 'C'+str(getworkers().index(id)+1)
-    # The A1 notation of the values to update.
-    range_ = 'Sheet1!'+cellloc+':'+cellloc  # TODO: Update placeholder value.
+        return 'Fail'
 
-    # How the input data should be interpreted.
-    value_input_option = 'RAW'  # TODO: Update placeholder value.
-    
-    value = str(datetime.datetime.now()).split('.')[0]
-    value_range_body = {
-            'values': [[str(value)]]
-    }
+def verifylegitrequest(id, batch, randomkey):
+    #try:
+        c.execute('SELECT "_rowid_",* FROM main WHERE WorkerKey=? AND BatchID=? AND RandomKey=?', (str(id),str(batch),str(randomkey)))
+        res = bool(c.fetchall())
+        if res:
+            workeralive(id)
+        return res
+    #except:
+    #    return False
 
-    request = service.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=range_, valueInputOption=value_input_option, body=value_range_body)
-    complete = False
-    while not complete:
-        try:
-            response = request.execute()
-            complete = True
-        except:
-            sleep(cooldown())
-
-def listexclusions(cellloc):
-
-    # Call the Sheets API
-    # The ID of the spreadsheet to update.
-    spreadsheet_id = MEM_SHEET_ID  # TODO: Update placeholder value.
-
-    # The A1 notation of the values to update.
-    range_ = 'Sheet1!C:C' #+cellloc  # TODO: Update placeholder value.
-
-    # How the input data should be interpreted.
-    value_render_option = 'RAW'  # TODO: Update placeholder value.
-
-    request = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=range_) #, valueRenderOption=value_render_option, dateTimeRenderOption=date_time_render_option)
-    complete = False
-    while not complete:
-        try:
-            response = request.execute()
-            complete = True
-        except:
-            sleep(cooldown())
-    #print(response)
-    return response['values']
-
-
-
-def updatecells(cellloc, value):
-
-    # Call the Sheets API
-    # The ID of the spreadsheet to update.
-    spreadsheet_id = MEM_SHEET_ID  # TODO: Update placeholder value.
-
-    # The A1 notation of the values to update.
-    range_ = 'Sheet1!'+cellloc+':'+cellloc  # TODO: Update placeholder value.
-
-    # How the input data should be interpreted.
-    value_input_option = 'RAW'  # TODO: Update placeholder value.
-
-    value_range_body = {
-            'values': [[str(value)]]
-    }
-
-    request = service.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=range_, valueInputOption=value_input_option, body=value_range_body)
-    complete = False
-    while not complete:
-        try:
-            response = request.execute()
-            complete = True
-        except:
-            sleep(cooldown())
-
-    
-def savestate(v1, v2):
-   
-
-    # Call the Sheets API
-    # The ID of the spreadsheet to update.
-    spreadsheet_id = MEM_SHEET_ID  # TODO: Update placeholder value.
-
-    # The A1 notation of the values to update.
-    range_ = 'Sheet1!A1:A2' #+cellloc  # TODO: Update placeholder value.
-
-    # How the input data should be interpreted.
-    value_input_option = 'RAW'  # TODO: Update placeholder value.
-
-    value_range_body = {
-            'values': [[str(v1)], [str(v2)]]
-    }
-
-    request = service.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=range_, valueInputOption=value_input_option, body=value_range_body)
-    complete = False
-    while not complete:
-        try:
-            response = request.execute()
-            complete = True
-        except:
-            sleep(cooldown())    
-
-def appendtosheet(inlist):
-    spreadsheet_id = MEM_SHEET_ID
-    range_name = 'Sheet1!A1:A'
-    mylist = [str(datetime.datetime.now()).split('.')[0]]
-    mylist.extend(inlist)
-    
-
-    # Call the Sheets API
-    values = [mylist]
-    body = {
-            'values': values
-    }
-    request = service.spreadsheets().values().append(
-            spreadsheetId=spreadsheet_id, range=range_name,
-            valueInputOption="RAW", body=body)
-    #print(result['tableRange'])
-
-    complete = False
-    while not complete:
-        try:
-            result = request.execute()
-            complete = True
-        except:
-            sleep(cooldown())
-    print('{0} cells appended.'.format(result \
-                                                                               .get('updates') \
-                                                                               .get('updatedCells')))    
-    return result['updates']['updatedRange'].split(':')[-1][1:]
-    
+def reopenavailability():
+    c.execute("update main set BatchStatus=0,AssignedTime=null where BatchStatusUpdateTime< datetime('now', '-1 hour') and BatchStatus=1") #Thanks @jopik
+    return 'Success'
 
 @app.route('/worker/getID')
 def give_id():
-    complete = False
-    while not complete:
-        desnum = random.randint(1, 1000000)
-        if desnum not in getworkers():
-            addworker(desnum)
-            complete = True
-    #workeralive(desnum) (now included in addworker)
-    return str(desnum)
+    return str(addworker())
 
 @app.route('/worker/getBatch') #Parameters: id
 def give_batch():
-    id = request.args.get('id', '')
-    #threading.Thread(target=workeralive, args=id).start()
-    if id not in getworkers():
+    id = str(request.args.get('id', ''))
+    workeralive(id)
+    if not getworkers(id):
         return 'Fail'
-    randomkey = random.randint(1, 10000)
-    batchid = appendtosheet(['a', '', str(randomkey), str(id)])
+    batchid, randomkey = assignBatch(id)
     myj = {'batchID': batchid, 'randomKey': str(randomkey)}
     myresp = Response(json.dumps(myj), mimetype='application/json')
     return myresp
 
-#@app.route('/worker/getExcludedBatch') #Parameters: id
-#def give_batch():
-#    id = request.args.get('id', '')
-#    randomkey = random.randint(1, 10000)
-#    batchid = appendtosheet(['a', '', str(randomkey), str(id)])
-#    myj = {'batchID': batchid, 'randomKey': str(randomkey)}
-#    myresp = Response(json.dumps(myj), mimetype='application/json')
-#    return myresp
-    
 @app.route('/worker/submitExclusion')
 def submit_exclusion(): #Parameters: id, batchID, randomKey, exclusion
     id = request.args.get('id', '')
-    #threading.Thread(target=workeralive, args=id).start()
-    if id not in getworkers():
-        return 'Fail'
     batchid = request.args.get('batchID', '')
     randomkey = request.args.get('randomKey', '')
-    exclusion = request.args.get('exclusion', '')
-    if not exclusion:
+    target = request.args.get('exclusion', '')
+    if not verifylegitrequest(id, batchid, randomkey):
         return 'Fail'
-    if getcell('D'+str(batchid)) == randomkey and getcell('E'+str(batchid)) == id: #valid submission
-        cellc = getcell('C'+str(batchid))
-        splitter = ','
-        if not cellc:
-            splitter = ''
-        updatecells('C'+str(batchid), (cellc+splitter+str(exclusion)))
-        return 'Success'
-    else:
+    if not target:
         return 'Fail'
-    
+    return(addtolist("Excluded", id, batchid, randomkey, target))
+
 @app.route('/worker/submitDeleted')
 def submit_deleted(): #Parameters: id, batchID, randomKey, deleted
     id = request.args.get('id', '')
-    #threading.Thread(target=workeralive, args=id).start()
-    if id not in getworkers():
-        return 'Fail'
     batchid = request.args.get('batchID', '')
     randomkey = request.args.get('randomKey', '')
-    deleted = request.args.get('deleted', '')
-    if not deleted:
+    target = request.args.get('deleted', '')
+    if not verifylegitrequest(id, batchid, randomkey):
         return 'Fail'
-    if getcell('D'+str(batchid)) == randomkey and getcell('E'+str(batchid)) == id: #valid submission
-        cellf = getcell('F'+str(batchid))
-        splitter = ','
-        if not cellf:
-            splitter = ''
-        updatecells('F'+str(batchid), (cellf+splitter+str(deleted)))
-        return 'Success'
-    else:
+    if not target:
         return 'Fail'
-    
+    return(addtolist("Deleted", id, batchid, randomkey, target))
+
 @app.route('/worker/submitPrivate')
 def submit_private(): #Parameters: id, batchID, randomKey, private
     id = request.args.get('id', '')
-    #threading.Thread(target=workeralive, args=id).start()
-    if id not in getworkers():
-        return 'Fail'
     batchid = request.args.get('batchID', '')
     randomkey = request.args.get('randomKey', '')
-    private = request.args.get('private', '')
-    if not private:
+    target = request.args.get('private', '')
+    if not verifylegitrequest(id, batchid, randomkey):
         return 'Fail'
-    if getcell('D'+str(batchid)) == randomkey and getcell('E'+str(batchid)) == id: #valid submission
-        cellg = getcell('G'+str(batchid))
-        splitter = ','
-        if not cellg:
-            splitter = ''
-        updatecells('G'+str(batchid), (cellg+splitter+str(private)))
-        return 'Success'
-    else:
+    if not target:
         return 'Fail'
+    return(addtolist("Privated", id, batchid, randomkey, target))
 
 @app.route('/worker/updateStatus')
 def update_status(): #Parameters: id, batchID, randomKey, status ('a'=assigned,) 'c'=completed, 'f'=failed
     id = request.args.get('id', '')
-    #threading.Thread(target=workeralive, args=id).start()
-    if id not in getworkers():
-        return 'Fail'
     batchid = request.args.get('batchID', '')
     randomkey = request.args.get('randomKey', '')
     status = request.args.get('status', '')
-    if getcell('D'+str(batchid)) == randomkey and getcell('E'+str(batchid)) == id and (status in ['c', 'f']): #valid submission
-        updatecells('B'+str(batchid), status)
-        return 'Success'
-    else:
+    if not verifylegitrequest(id, batchid, randomkey):
         return 'Fail'
+    if not status in ['c', 'f']: #valid submission
+        return 'Fail'
+    else:
+        updatestatus(id, batchid, randomkey, status)
+        return 'Success'
+
+@app.route('/internal/dumpdb')
+def dumpdb():
+    myul = drive.CreateFile({'title': 'dbDUMP.db'})
+    myul.SetContentFile('db.db')
+    myul.Upload()
+    return str(myul['id'])
+
+@app.route('/internal/purgeinactive')
+def request_reopen():
+    return reopenavailability()
+
+@app.route('/internal/ipcheck')
+def give_ip():
+    return request.headers['X-Forwarded-For']
 
 @app.route('/robots.txt')
 def download_robots_txt():
