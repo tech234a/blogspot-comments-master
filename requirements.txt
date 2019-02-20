@@ -1,8 +1,5 @@
-google-api-python-client
-google-auth-httplib2
-google-auth-oauthlib
 requests
 pydrive
 flask
 gunicorn
-hurry.filesize
+heroku3
