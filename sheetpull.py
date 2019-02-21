@@ -93,7 +93,6 @@ def assignBatch(id, ip):
     return ans, randomkey
 
 def addtolist(list, id, batch, randomkey, item):
-    #try:
     item = item.lower()
     c.execute('SELECT '+str(list)+' FROM main WHERE BatchID=?', (str(batch),))
     res = c.fetchall()[0][0]
@@ -108,34 +107,26 @@ def addtolist(list, id, batch, randomkey, item):
         c.execute('INSERT into exclusions ("ExclusionName", "BatchStatus", "BatchStatusUpdateTime") VALUES (?, 0, CURRENT_TIMESTAMP)', (str(item),))
     c.execute('UPDATE main SET "'+str(list)+'"=? WHERE BatchID=?', ((str(splitter)+str(item)), str(batch)))
     return 'Success'
-    #except:
-    #    return 'Fail'
 
 def updatestatus(id, batch, randomkey, status, ip):
-    #try:
-        c.execute('SELECT BatchStatus from main where BatchID=?', (batch,))
-        ans = c.fetchall()[0][0]
-        if str(ans) != '1':
-            return 'Fail'
-        else:
-            numstatus = ['f', '', 'c'].index(status)
-            c.execute('UPDATE main SET BatchStatus=?, BatchStatusUpdateTime=CURRENT_TIMESTAMP, BatchStatusUpdateIP=? WHERE BatchID=? AND RandomKey=? AND WorkerKey=?', (numstatus, ip, batch, str(randomkey),str(id),))
-            if status == 'f':
-                return 'Success'
-            elif status == 'c':
-                return str(s3.generate_url(300, 'PUT', S3_BUCKET, str(batch)))
-    #except:
-    #    return 'Fail'
+    c.execute('SELECT BatchStatus from main where BatchID=?', (batch,))
+    ans = c.fetchall()[0][0]
+    if str(ans) != '1':
+        return 'Fail'
+    else:
+        numstatus = ['f', '', 'c'].index(status)
+        c.execute('UPDATE main SET BatchStatus=?, BatchStatusUpdateTime=CURRENT_TIMESTAMP, BatchStatusUpdateIP=? WHERE BatchID=? AND RandomKey=? AND WorkerKey=?', (numstatus, ip, batch, str(randomkey),str(id),))
+        if status == 'f':
+            return 'Success'
+        elif status == 'c':
+            return str(s3.generate_url(300, 'PUT', S3_BUCKET, str(batch)))
 
 def verifylegitrequest(id, batch, randomkey, ip):
-    #try:
-        c.execute('SELECT "_rowid_",* FROM main WHERE WorkerKey=? AND BatchID=? AND RandomKey=?', (str(id),str(batch),str(randomkey)))
-        res = bool(c.fetchall())
-        if res:
-            workeralive(id, ip)
-        return res
-    #except:
-    #    return False
+    c.execute('SELECT "_rowid_",* FROM main WHERE BatchStatus=1, WorkerKey=? AND BatchID=? AND RandomKey=?', (str(id),str(batch),str(randomkey)))
+    res = bool(c.fetchall())
+    if res:
+        workeralive(id, ip)
+    return res
 
 def reopenavailability():
     c.execute("update main set BatchStatus=0,AssignedTime=null where BatchStatusUpdateTime< datetime('now', '-1 hour') and BatchStatus=1") #Thanks @jopik
