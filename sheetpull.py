@@ -1,4 +1,4 @@
-import os, time, datetime, random, json, sqlite3, signal, uuid, requests, pydrive, flask, heroku3
+import os, time, datetime, random, json, sqlite3, signal, uuid, requests, pydrive, flask, heroku3, boto
 from time import sleep
 
 from pydrive.auth import GoogleAuth
@@ -23,7 +23,14 @@ gauth.SaveCredentialsFile("credentials.txt")
 
 drive = GoogleDrive(gauth)
 
-sleep(20) #Safety cushion
+#IAS3 Auth (Credentials provided via standard Boto Environment Variables)
+from boto.s3.key import Key
+from boto.s3.connection import OrdinaryCallingFormat
+
+s3 = boto.connect_s3(host='s3.us.archive.org', is_secure=False, calling_format=OrdinaryCallingFormat())
+S3_BUCKET = 'asdfjkljklsdfajkldsf'
+
+sleep(15) #Safety cushion
 
 #DL the DB
 mysf = drive.CreateFile({'id': str(heroku3.from_key(os.environ['heroku-key']).apps()['getblogspot-01'].config()['dbid'])})
@@ -106,9 +113,17 @@ def addtolist(list, id, batch, randomkey, item):
 
 def updatestatus(id, batch, randomkey, status, ip):
     #try:
-        numstatus = ['f', '', 'c'].index(status)
-        c.execute('UPDATE main SET BatchStatus=?, BatchStatusUpdateTime=CURRENT_TIMESTAMP, BatchStatusUpdateIP=? WHERE BatchID=? AND RandomKey=? AND WorkerKey=?', (numstatus, str(batch), ip, str(randomkey),str(id),))
-        return 'Success'
+        c.execute('SELECT BatchStatus from main where BatchID=?', (batch,))
+        ans = c.fetchall()[0][0]
+        if str(ans) != '1':
+            return 'Fail'
+        else:
+            numstatus = ['f', '', 'c'].index(status)
+            c.execute('UPDATE main SET BatchStatus=?, BatchStatusUpdateTime=CURRENT_TIMESTAMP, BatchStatusUpdateIP=? WHERE BatchID=? AND RandomKey=? AND WorkerKey=?', (numstatus, ip, batch, str(randomkey),str(id),))
+            if status == 'f':
+                return 'Success'
+            elif status == 'c':
+                return str(s3.generate_url(300, 'PUT', S3_BUCKET, str(batch)))
     #except:
     #    return 'Fail'
 
@@ -194,8 +209,7 @@ def update_status(): #Parameters: id, batchID, randomKey, status ('a'=assigned,)
     if not status in ['c', 'f']: #valid submission
         return 'Fail'
     else:
-        updatestatus(id, batchid, randomkey, status, ip)
-        return 'Success'
+        return updatestatus(id, batchid, randomkey, status, ip)
 
 @app.route('/internal/dumpdb')
 def dumpdb():
