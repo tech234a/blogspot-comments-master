@@ -3,3 +3,4 @@ pydrive
 flask
 gunicorn
 heroku3
+boto
