@@ -1,4 +1,4 @@
-import os, time, datetime, random, json, sqlite3, signal, uuid, requests, pydrive, flask, heroku3, boto
+import os, time, datetime, random, json, sqlite3, signal, uuid, requests, pydrive, flask, heroku3, boto3
 from time import sleep
 
 from pydrive.auth import GoogleAuth
@@ -24,10 +24,12 @@ gauth.SaveCredentialsFile("credentials.txt")
 drive = GoogleDrive(gauth)
 
 #IAS3 Auth (Credentials provided via standard Boto Environment Variables)
-from boto.s3.key import Key
-from boto.s3.connection import OrdinaryCallingFormat
+#from boto.s3.key import Key
+#from boto.s3.connection import OrdinaryCallingFormat
 
-s3 = boto.connect_s3(host='s3.us.archive.org', is_secure=False, calling_format=OrdinaryCallingFormat())
+#s3 = boto.connect_s3(host='s3.us.archive.org', is_secure=False, calling_format=OrdinaryCallingFormat())
+session = boto3.session.Session()
+s3_client = session.client(service_name='s3', endpoint_url='http://s3.us.archive.org')
 S3_BUCKET = 'asdfjkljklsdfajkldsf'
 
 sleep(15) #Safety cushion
@@ -115,14 +117,13 @@ def updatestatus(id, batch, randomkey, status, ip):
         return 'Fail'
     else:
         numstatus = ['f', '', 'c'].index(status)
-        c.execute('UPDATE main SET BatchStatus=?, BatchStatusUpdateTime=CURRENT_TIMESTAMP, BatchStatusUpdateIP=? WHERE BatchID=? AND RandomKey=? AND WorkerKey=?', (numstatus, ip, batch, str(randomkey),str(id),))
-        if status == 'f':
-            return 'Success'
-        elif status == 'c':
+        if status == 'c':
             return str(s3.generate_url(300, 'PUT', S3_BUCKET, str(batch)))
+        c.execute('UPDATE main SET BatchStatus=?, BatchStatusUpdateTime=CURRENT_TIMESTAMP, BatchStatusUpdateIP=? WHERE BatchID=? AND RandomKey=? AND WorkerKey=?', (numstatus, ip, batch, str(randomkey),str(id),))
+        return 'Success'
 
 def verifylegitrequest(id, batch, randomkey, ip):
-    c.execute('SELECT "_rowid_",* FROM main WHERE BatchStatus=1, WorkerKey=? AND BatchID=? AND RandomKey=?', (str(id),str(batch),str(randomkey)))
+    c.execute('SELECT * FROM main WHERE BatchStatus=1 AND WorkerKey=? AND BatchID=? AND RandomKey=?', (str(id),str(batch),str(randomkey),))
     res = bool(c.fetchall())
     if res:
         workeralive(id, ip)
@@ -131,6 +132,9 @@ def verifylegitrequest(id, batch, randomkey, ip):
 def reopenavailability():
     c.execute("update main set BatchStatus=0,AssignedTime=null where BatchStatusUpdateTime< datetime('now', '-1 hour') and BatchStatus=1") #Thanks @jopik
     return 'Success'
+
+def generateurl(batch):
+    return str(s3_client.generate_presigned_url('put_object', Params={'Bucket': str(S3_BUCKET), 'Key':  str(batch)+'.json.gz'}, ExpiresIn=3600, HttpMethod='PUT'))
 
 @app.route('/worker/getID')
 def give_id():
@@ -201,6 +205,17 @@ def update_status(): #Parameters: id, batchID, randomKey, status ('a'=assigned,)
         return 'Fail'
     else:
         return updatestatus(id, batchid, randomkey, status, ip)
+    
+@app.route('/worker/getUploadURL')
+def get_url(): #Parameters: id, batchID, randomKey
+    id = request.args.get('id', '')
+    batchid = request.args.get('batchID', '')
+    randomkey = request.args.get('randomKey', '')
+    ip = request.headers['X-Forwarded-For']
+    if not verifylegitrequest(id, batchid, randomkey, ip):
+        return 'Fail'
+    else:
+        return generateurl(batchid)
 
 @app.route('/internal/dumpdb')
 def dumpdb():
