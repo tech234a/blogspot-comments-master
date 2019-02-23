@@ -1,5 +1,7 @@
-import os, time, datetime, random, json, sqlite3, signal, uuid, requests, pydrive, flask, heroku3, boto3
+import os, time, datetime, random, json, sqlite3, signal, uuid, csv, requests, pydrive, flask, heroku3
 from time import sleep
+
+from hurry.filesize import size, alternative
 
 from pydrive.auth import GoogleAuth
 from pydrive.drive import GoogleDrive
@@ -23,16 +25,15 @@ gauth.SaveCredentialsFile("credentials.txt")
 
 drive = GoogleDrive(gauth)
 
-#IAS3 Auth (Credentials provided via standard Boto Environment Variables)
-#from boto.s3.key import Key
-#from boto.s3.connection import OrdinaryCallingFormat
+infile = open('offset.csv', mode='r')
+reader = csv.reader(infile)
+offsets = dict((rows[0],rows[1]) for rows in reader)
+infile.close()
 
-#s3 = boto.connect_s3(host='s3.us.archive.org', is_secure=False, calling_format=OrdinaryCallingFormat())
-session = boto3.session.Session()
-s3_client = session.client(service_name='s3', endpoint_url='http://s3.us.archive.org')
-S3_BUCKET = 'asdfjkljklsdfajkldsf'
+mysf = drive.CreateFile({'id': '1U27xcHSk91JXj2-1TVvoVpBJq3HQDLvt'})
+mysf.GetContentFile('domains_list.txt')
 
-sleep(15) #Safety cushion
+sleep(10) #Safety cushion
 
 #DL the DB
 mysf = drive.CreateFile({'id': str(heroku3.from_key(os.environ['heroku-key']).apps()['getblogspot-01'].config()['dbid'])})
@@ -42,7 +43,9 @@ del mysf
 from flask import Flask
 from flask import Response
 from flask import request
+from flask_caching import Cache
 app = Flask(__name__)
+cache = Cache(app,config={'CACHE_TYPE': 'simple'})
 
 #DB Inititalization
 conn = sqlite3.connect('db.db')
@@ -83,16 +86,25 @@ def workeralive(id, ip):
     return
 
 def assignBatch(id, ip):
+    limit = 450
     randomkey = random.randint(1, 10000)
     #Mutex lock used to prevent different workers getting the same batch id
     with assignBatchLock:
                           #only one thread can execute here
-        c.execute('SELECT BatchID from main where BatchStatus=0 LIMIT 1')
-        ans = c.fetchall()[0][0]
+        c.execute('SELECT * from main where BatchStatus=0 LIMIT 1')
+        datalist = c.fetchone()
+        ans = datalist[0]
+        if datalist[4]:
+            dltype = "domain"
+            content = datalist[4]
+        else:
+            dltype = "list"
+            content = ""
+        myoffset = offsets[str(ans)]
         if not ans:
             return "Fail", "Fail"
         c.execute('UPDATE main SET BatchStatus=1, WorkerKey=?, RandomKey=?, AssignedTime=CURRENT_TIMESTAMP, BatchStatusUpdateTime=CURRENT_TIMESTAMP, BatchStatusUpdateIP=? WHERE BatchID=?',(id,randomkey,ip,ans))
-    return ans, randomkey
+    return ans, randomkey, myoffset, limit, dltype, content
 
 def addtolist(list, id, batch, randomkey, item):
     item = item.lower()
@@ -106,7 +118,8 @@ def addtolist(list, id, batch, randomkey, item):
             return 'Fail'
         splitter = str(res) + ','
     if list == 'Excluded':
-        c.execute('INSERT into exclusions ("ExclusionName", "BatchStatus", "BatchStatusUpdateTime") VALUES (?, 0, CURRENT_TIMESTAMP)', (str(item),))
+        c.execute('INSERT into main (BatchContent, BatchStatus) VALUES(?,0)', (str(item),))
+        #c.execute('INSERT into exclusions ("ExclusionName", "BatchStatus", "BatchStatusUpdateTime") VALUES (?, 0, CURRENT_TIMESTAMP)', (str(item),))
     c.execute('UPDATE main SET "'+str(list)+'"=? WHERE BatchID=?', ((str(splitter)+str(item)), str(batch)))
     return 'Success'
 
@@ -118,7 +131,12 @@ def updatestatus(id, batch, randomkey, status, ip):
     else:
         numstatus = ['f', '', 'c'].index(status)
         if status == 'c':
-            return str(s3.generate_url(300, 'PUT', S3_BUCKET, str(batch)))
+            myrdata = requests.get('http://blogstore.bot.nu/getVerifyBatchUnit?batchID='+str(batch)+'&batchKey='+str(randomkey))
+            if myrdata.status_code != 200:
+                return 'Fail'
+            size = int(myrdata.json['size'])
+            c.execute('UPDATE main SET BatchStatus=?, BatchStatusUpdateTime=CURRENT_TIMESTAMP, BatchStatusUpdateIP=?, BatchSize=? WHERE BatchID=? AND RandomKey=? AND WorkerKey=?', (numstatus, ip, size, batch, str(randomkey), str(id),))
+            return 'Success'
         c.execute('UPDATE main SET BatchStatus=?, BatchStatusUpdateTime=CURRENT_TIMESTAMP, BatchStatusUpdateIP=? WHERE BatchID=? AND RandomKey=? AND WorkerKey=?', (numstatus, ip, batch, str(randomkey),str(id),))
         return 'Success'
 
@@ -133,9 +151,31 @@ def reopenavailability():
     c.execute("update main set BatchStatus=0,AssignedTime=null where BatchStatusUpdateTime< datetime('now', '-1 hour') and BatchStatus=1") #Thanks @jopik
     return 'Success'
 
-def generateurl(batch):
-    return str(s3_client.generate_presigned_url('put_object', Params={'Bucket': str(S3_BUCKET), 'Key':  str(batch)+'.json.gz'}, ExpiresIn=3600, HttpMethod='PUT'))
-
+def gen_stats():
+    result = {}
+    c.execute('SELECT count(*) FROM main WHERE BatchStatus=1')
+    result['batches_assigned'] = c.fetchone()[0]
+    c.execute('SELECT count(*) FROM main WHERE BatchStatus=2')
+    result['batches_completed'] = c.fetchone()[0]
+    c.execute("SELECT count(*) FROM main WHERE BatchStatusUpdateTime> datetime('now', '-1 hour') and BatchStatus=2")
+    result['batches_completed_last_hour'] = c.fetchone()[0]
+    c.execute('SELECT sum(BatchSize) FROM main')
+    c.execute('SELECT count(*) FROM main WHERE BatchStatus=0')
+    result['batches_remaining'] = c.fetchone()[0]
+    try:
+        result['total_data_size'] = c.fetchone()[0]
+    except:
+        result['total_data_size'] = 0
+    result['total_data_size_pretty'] = size(result['total_data_size'], system=alternative)
+    c.execute('SELECT count(BatchContent) FROM main')
+    result['total_exclusions'] = c.fetchone()[0]
+    c.execute('SELECT COUNT(*) FROM workers') 
+    result['worker_count'] = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM workers where LastAliveTime> datetime('now', '-1 hour')")
+    result['worker_count_last_hour'] = c.fetchone()[0]
+    return json.dumps(result)
+    
+    
 @app.route('/worker/getID')
 def give_id():
     ip = request.headers['X-Forwarded-For']
@@ -148,8 +188,8 @@ def give_batch():
     workeralive(id, ip)
     if not getworkers(id):
         return 'Fail'
-    batchid, randomkey = assignBatch(id, ip)
-    myj = {'batchID': batchid, 'randomKey': str(randomkey)}
+    batchid, randomkey, curroffset, limit, dltype, content = assignBatch(id, ip)
+    myj = {'batchID': batchid, 'randomKey': str(randomkey), 'offset': curroffset, 'limit': limit, 'assignmentType': dltype, 'content': content}
     myresp = Response(json.dumps(myj), mimetype='application/json')
     return myresp
 
@@ -206,16 +246,14 @@ def update_status(): #Parameters: id, batchID, randomKey, status ('a'=assigned,)
     else:
         return updatestatus(id, batchid, randomkey, status, ip)
     
-@app.route('/worker/getUploadURL')
-def get_url(): #Parameters: id, batchID, randomKey
-    id = request.args.get('id', '')
-    batchid = request.args.get('batchID', '')
-    randomkey = request.args.get('randomKey', '')
-    ip = request.headers['X-Forwarded-For']
-    if not verifylegitrequest(id, batchid, randomkey, ip):
-        return 'Fail'
-    else:
-        return generateurl(batchid)
+@app.route('/worker/getStats')
+@cache.cached(timeout=30)
+def get_stats():
+    return Response(gen_stats(), mimetype='application/json')
+
+@app.route('/worker/domains.txt')
+def download_list():
+    return flask.send_file("domains_list.txt", mimetype='text/plain', as_attachment=True)
 
 @app.route('/internal/dumpdb')
 def dumpdb():
@@ -227,10 +265,6 @@ def dumpdb():
 @app.route('/internal/purgeinactive')
 def request_reopen():
     return reopenavailability()
-
-@app.route('/internal/ipcheck')
-def give_ip():
-    return request.headers['X-Forwarded-For']
 
 @app.route('/robots.txt')
 def download_robots_txt():
