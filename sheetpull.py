@@ -91,18 +91,18 @@ def assignBatch(id, ip):
     #Mutex lock used to prevent different workers getting the same batch id
     with assignBatchLock:
                           #only one thread can execute here
-        c.execute('SELECT * from main where BatchStatus=0 LIMIT 1')
+        c.execute('SELECT BatchID, BatchContent from main where BatchStatus=0 LIMIT 1')
         datalist = c.fetchone()
         ans = datalist[0]
-        if datalist[4]:
+        if datalist[1]:
             dltype = "domain"
-            content = datalist[4]
+            content = datalist[1]
         else:
             dltype = "list"
             content = ""
         myoffset = offsets[str(ans)]
         if not ans:
-            return "Fail", "Fail"
+            return "Fail", "Fail", "Fail", "Fail", "Fail", "Fail"
         c.execute('UPDATE main SET BatchStatus=1, WorkerKey=?, RandomKey=?, AssignedTime=CURRENT_TIMESTAMP, BatchStatusUpdateTime=CURRENT_TIMESTAMP, BatchStatusUpdateIP=? WHERE BatchID=?',(id,randomkey,ip,ans))
     return ans, randomkey, myoffset, limit, dltype, content
 
