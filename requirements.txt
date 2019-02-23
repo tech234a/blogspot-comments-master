@@ -1,6 +1,8 @@
+
 requests
 pydrive
 flask
 gunicorn
 heroku3
-boto
+Flask-Caching
+hurry.filesize
