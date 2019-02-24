@@ -1,4 +1,4 @@
-import os, time, datetime, random, json, sqlite3, signal, uuid, csv, requests, pydrive, flask, heroku3
+import os, time, datetime, random, json, sqlite3, signal, uuid, csv, requests, pydrive, flask, heroku3, fasteners
 from time import sleep
 
 from hurry.filesize import size, alternative
@@ -6,6 +6,7 @@ from hurry.filesize import size, alternative
 from pydrive.auth import GoogleAuth
 from pydrive.drive import GoogleDrive
 
+from multiprocessing import Lock
 from threading import Lock
 #Mutex lock used to prevent different workers getting the same batch id
 assignBatchLock = Lock()
@@ -69,13 +70,19 @@ class GracefulKiller:
         #  os.remove("backup.db")
         #else:
         #  print("The file does not exist")
-        with sqlite3.connect('backup.db') as bck:
-            conn.backup(bck)#, pages=1, progress=progress)
-        myul = drive.CreateFile({'title': 'db.db'})
-        myul.SetContentFile('backup.db')
-        myul.Upload()
-        heroku3.from_key(os.environ['heroku-key']).apps()['getblogspot-01'].config()['dbid'] = myul['id']
-        del myul
+        a_lock = fasteners.InterProcessLock('tmp_lock_file')
+        gotten = a_lock.acquire(blocking=False)
+        if gotten:
+            print('Gotten lock')
+            with sqlite3.connect('backup_quit.db') as bck:
+                conn.backup(bck)#, pages=1, progress=progress)
+            myul = drive.CreateFile({'title': 'db.db'})
+            myul.SetContentFile('backup_quit.db')
+            myul.Upload()
+            heroku3.from_key(os.environ['heroku-key']).apps()['getblogspot-01'].config()['dbid'] = myul['id']
+            del myul
+            a_lock.release()
+        print('Exiting...')    
         exit()
 
 killer = GracefulKiller()
