@@ -52,8 +52,8 @@ conn = sqlite3.connect('db.db')
 conn.isolation_level= None # turn on autocommit to increase concurency
 c = conn.cursor()
 
-def progress(status, remaining, total):
-    print(f'Copied {total-remaining} of {total} pages...')
+#def progress(status, remaining, total):
+#    print(f'Copied {total-remaining} of {total} pages...')
 
 #Graceful Shutdown
 class GracefulKiller:
@@ -65,14 +65,13 @@ class GracefulKiller:
     def exit_gracefully(self,signum, frame):
         self.kill_now = True
         sleep(3)
-        if os.path.exists("backup.db"):
-          os.remove("backup.db")
-        else:
-          print("The file does not exist")
+        #if os.path.exists("backup.db"):
+        #  os.remove("backup.db")
+        #else:
+        #  print("The file does not exist")
         with sqlite3.connect('backup.db') as bck:
-            conn.backup(bck, pages=1, progress=progress)
+            conn.backup(bck)#, pages=1, progress=progress)
         myul = drive.CreateFile({'title': 'db.db'})
-        sleep(5)
         myul.SetContentFile('backup.db')
         myul.Upload()
         heroku3.from_key(os.environ['heroku-key']).apps()['getblogspot-01'].config()['dbid'] = myul['id']
@@ -266,19 +265,21 @@ def download_list():
     return flask.send_file("domains_list.txt", mimetype='text/plain', as_attachment=True)
 
 @app.route('/internal/dumpdb')
+@cache.cached(timeout=300)
 def dumpdb():
-    if os.path.exists("backup.db"):
-        os.remove("backup.db")
-    else:
-        print("The file does not exist")
+    #if os.path.exists("backup.db"):
+    #    os.remove("backup.db")
+    #else:
+    #    print("The file does not exist")
     with sqlite3.connect('backup.db') as bck:
-        conn.backup(bck, pages=1, progress=progress)
+        conn.backup(bck)#, pages=1, progress=progress)
     myul = drive.CreateFile({'title': 'dbDUMP.db'})
     myul.SetContentFile('backup.db')
     myul.Upload()
     return str(myul['id'])
 
 @app.route('/internal/purgeinactive')
+@cache.cached(timeout=30)
 def request_reopen():
     return reopenavailability()
 
