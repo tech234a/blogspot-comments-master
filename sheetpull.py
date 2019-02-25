@@ -34,12 +34,25 @@ infile.close()
 mysf = drive.CreateFile({'id': '1U27xcHSk91JXj2-1TVvoVpBJq3HQDLvt'})
 mysf.GetContentFile('domains_list.txt')
 
-sleep(10) #Safety cushion
+sleep(15) #Safety cushion
 
-#DL the DB
-mysf = drive.CreateFile({'id': str(heroku3.from_key(os.environ['heroku-key']).apps()['getblogspot-01'].config()['dbid'])})
-mysf.GetContentFile('db.db')
-del mysf
+a_lock = fasteners.InterProcessLock('tmp_lock_file_init')
+gotten = a_lock.acquire(blocking=False)
+if gotten and (not os.path.exists('db.db')):
+    print('Gotten lock')
+    #DL the DB
+    mysf = drive.CreateFile({'id': str(heroku3.from_key(os.environ['heroku-key']).apps()['getblogspot-01'].config()['dbid'])})
+    mysf.GetContentFile('db.db')
+    del mysf
+    a_lock.release()
+    print('Loaded DB')
+else:
+    sleep(7)
+    print('T2 up')
+    #print('Waiting for lock to finish...')
+    #gotten = a_lock.acquire()
+    #print('DB Done')
+
 
 from flask import Flask
 from flask import Response
@@ -103,6 +116,7 @@ def workeralive(id, ip):
 
 def assignBatch(id, ip):
     limit = 450
+    batchsize = 250
     randomkey = random.randint(1, 10000)
     #Mutex lock used to prevent different workers getting the same batch id
     with assignBatchLock:
@@ -118,9 +132,9 @@ def assignBatch(id, ip):
             content = ""
         myoffset = offsets[str(ans)]
         if not ans:
-            return "Fail", "Fail", "Fail", "Fail", "Fail", "Fail"
+            return "Fail", "Fail", "Fail", "Fail", "Fail", "Fail", "Fail"
         c.execute('UPDATE main SET BatchStatus=1, WorkerKey=?, RandomKey=?, AssignedTime=CURRENT_TIMESTAMP, BatchStatusUpdateTime=CURRENT_TIMESTAMP, BatchStatusUpdateIP=? WHERE BatchID=?',(id,randomkey,ip,ans))
-    return ans, randomkey, myoffset, limit, dltype, content
+    return ans, randomkey, myoffset, limit, dltype, content, batchsize
 
 def addtolist(list, id, batch, randomkey, item):
     item = item.lower()
@@ -131,12 +145,25 @@ def addtolist(list, id, batch, randomkey, item):
         splitter = ''
     if res:
         if str(item) in str(res).split(','):
-            return 'Fail'
+            return 'Dupe'
         splitter = str(res) + ','
     if list == 'Excluded':
+        c.execute('SELECT COUNT(*) from main where BatchContent=?', (str(item),))
+        if bool(c.fetchone()[0]):
+            return 'Dupe'
         c.execute('INSERT into main (BatchContent, BatchStatus) VALUES(?,0)', (str(item),))
         #c.execute('INSERT into exclusions ("ExclusionName", "BatchStatus", "BatchStatusUpdateTime") VALUES (?, 0, CURRENT_TIMESTAMP)', (str(item),))
     c.execute('UPDATE main SET "'+str(list)+'"=? WHERE BatchID=?', ((str(splitter)+str(item)), str(batch)))
+    return 'Success'
+
+def addcustom(item, domain):
+    c.execute('SELECT COUNT(*) from domains where blogspot=?', (str(item),))
+    if bool(c.fetchone()[0]):
+        return 'Dupe'
+    c.execute('SELECT COUNT(*) from domains where custom=?', (str(domain),))
+    if bool(c.fetchone()[0]):
+        return 'Dupe'
+    c.execute('INSERT into domains (blogspot, custom) VALUES(?,?)', (str(item),str(domain),))
     return 'Success'
 
 def updatestatus(id, batch, randomkey, status, ip):
@@ -150,7 +177,7 @@ def updatestatus(id, batch, randomkey, status, ip):
             myrdata = requests.get('http://blogstore.bot.nu/getVerifyBatchUnit?batchID='+str(batch)+'&batchKey='+str(randomkey))
             if myrdata.status_code != 200:
                 return 'Fail'
-            size = int(myrdata.json['size'])
+            size = int(myrdata.json()['size'])
             c.execute('UPDATE main SET BatchStatus=?, BatchStatusUpdateTime=CURRENT_TIMESTAMP, BatchStatusUpdateIP=?, BatchSize=? WHERE BatchID=? AND RandomKey=? AND WorkerKey=?', (numstatus, ip, size, batch, str(randomkey), str(id),))
             return 'Success'
         c.execute('UPDATE main SET BatchStatus=?, BatchStatusUpdateTime=CURRENT_TIMESTAMP, BatchStatusUpdateIP=? WHERE BatchID=? AND RandomKey=? AND WorkerKey=?', (numstatus, ip, batch, str(randomkey),str(id),))
@@ -175,12 +202,18 @@ def gen_stats():
     result['batches_completed'] = c.fetchone()[0]
     c.execute("SELECT count(*) FROM main WHERE BatchStatusUpdateTime> datetime('now', '-1 hour') and BatchStatus=2")
     result['batches_completed_last_hour'] = c.fetchone()[0]
-    c.execute('SELECT sum(BatchSize) FROM main')
     c.execute('SELECT count(*) FROM main WHERE BatchStatus=0')
     result['batches_remaining'] = c.fetchone()[0]
+    c.execute('SELECT count(*) FROM main')
+    result['batches_total'] = c.fetchone()[0]
+    c.execute('SELECT COUNT(*) from domains')
+    result['total_custom_domains'] = c.fetchone()[0]
+    c.execute('SELECT sum(BatchSize) FROM main')
     try:
         result['total_data_size'] = c.fetchone()[0]
     except:
+        result['total_data_size'] = 0
+    if result['total_data_size'] == None:
         result['total_data_size'] = 0
     result['total_data_size_pretty'] = size(result['total_data_size'], system=alternative)
     c.execute('SELECT count(BatchContent) FROM main')
@@ -204,8 +237,8 @@ def give_batch():
     workeralive(id, ip)
     if not getworkers(id):
         return 'Fail'
-    batchid, randomkey, curroffset, limit, dltype, content = assignBatch(id, ip)
-    myj = {'batchID': batchid, 'randomKey': str(randomkey), 'offset': curroffset, 'limit': limit, 'assignmentType': dltype, 'content': content}
+    batchid, randomkey, curroffset, limit, dltype, content, batchsize = assignBatch(id, ip)
+    myj = {'batchID': batchid, 'randomKey': str(randomkey), 'offset': curroffset, 'limit': limit, 'assignmentType': dltype, 'content': content, 'batchSize': batchsize}
     myresp = Response(json.dumps(myj), mimetype='application/json')
     return myresp
 
@@ -248,6 +281,22 @@ def submit_private(): #Parameters: id, batchID, randomKey, private
         return 'Fail'
     return(addtolist("Privated", id, batchid, randomkey, target))
 
+@app.route('/worker/submitDomain')
+def submit_domain(): #Parameters: id, batchID, randomKey, blog, domain
+    id = request.args.get('id', '')
+    batchid = request.args.get('batchID', '')
+    randomkey = request.args.get('randomKey', '')
+    target = request.args.get('blog', '')
+    customdomain = request.args.get('domain', '')
+    ip = request.headers['X-Forwarded-For']
+    if not verifylegitrequest(id, batchid, randomkey, ip):
+        return 'Fail'
+    if not target:
+        return 'Fail'
+    if not customdomain:
+        return 'Fail'
+    return(addcustom(target, customdomain))
+
 @app.route('/worker/updateStatus')
 def update_status(): #Parameters: id, batchID, randomKey, status ('a'=assigned,) 'c'=completed, 'f'=failed
     id = request.args.get('id', '')
@@ -284,6 +333,10 @@ def dumpdb():
     myul.SetContentFile('backup.db')
     myul.Upload()
     return str(myul['id'])
+
+@app.route('/wakemydyno.txt')
+def wake_registration():
+    return Response('OK', mimetype='text/plain')
 
 @app.route('/internal/purgeinactive')
 @cache.cached(timeout=30)
