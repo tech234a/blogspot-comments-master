@@ -234,7 +234,7 @@ def gen_stats():
     result['worker_count_last_10_minutes'] = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM workers where LastAliveTime> datetime('now', '-1 hour')")
     result['worker_count_last_hour'] = c.fetchone()[0]
-c.execute('SELECT COUNT(DISTINCT LastAliveIP) FROM workers') 
+    c.execute('SELECT COUNT(DISTINCT LastAliveIP) FROM workers') 
     result['worker_id_count'] = c.fetchone()[0]
     c.execute("SELECT COUNT(DISTINCT LastAliveIP) FROM workers where LastAliveTime> datetime('now', '-10 minute')")
     result['worker_id_count_last_10_minutes'] = c.fetchone()[0]
