@@ -115,6 +115,7 @@ def workeralive(id, ip):
     return
 
 def assignBatch(id, ip):
+    #reopenavailability()
     limit = 450
     batchsize = 250
     randomkey = random.randint(1, 10000)
@@ -190,22 +191,29 @@ def verifylegitrequest(id, batch, randomkey, ip):
         workeralive(id, ip)
     return res
 
+@cache.cached(timeout=300, key_prefix='purge_inactive_tasks')
 def reopenavailability():
-    c.execute("update main set BatchStatus=0,AssignedTime=null where BatchStatusUpdateTime< datetime('now', '-1 hour') and BatchStatus=1") #Thanks @jopik
+    c.execute("update main set BatchStatus=0,AssignedTime=null where BatchStatusUpdateTime< datetime('now', '-2 hour') and BatchStatus=1") #Thanks @jopik
     return 'Success'
 
 def gen_stats():
     result = {}
+    c.execute("select avg(strftime('%s',BatchStatusUpdateTime) -strftime('%s',AssignedTime) ) from main where  BatchStatus=2")
+    result['average_batch_time_seconds'] = c.fetchone()[0]
     c.execute('SELECT count(*) FROM main WHERE BatchStatus=1')
     result['batches_assigned'] = c.fetchone()[0]
     c.execute('SELECT count(*) FROM main WHERE BatchStatus=2')
     result['batches_completed'] = c.fetchone()[0]
+    c.execute("SELECT count(*) FROM main WHERE BatchStatusUpdateTime> datetime('now', '-10 minute') and BatchStatus=2")
+    result['batches_completed_last_10_minutes'] = c.fetchone()[0]
     c.execute("SELECT count(*) FROM main WHERE BatchStatusUpdateTime> datetime('now', '-1 hour') and BatchStatus=2")
     result['batches_completed_last_hour'] = c.fetchone()[0]
     c.execute('SELECT count(*) FROM main WHERE BatchStatus=0')
     result['batches_remaining'] = c.fetchone()[0]
     c.execute('SELECT count(*) FROM main')
     result['batches_total'] = c.fetchone()[0]
+    #result['projected_hours_remaining'] = (result['average_batch_time_seconds'] * result['batches_remaining'])/3600
+    result['batches_completed_percent'] = (result['batches_completed']/result['batches_total'])*100
     c.execute('SELECT COUNT(*) from domains')
     result['total_custom_domains'] = c.fetchone()[0]
     c.execute('SELECT sum(BatchSize) FROM main')
@@ -220,8 +228,12 @@ def gen_stats():
     result['total_exclusions'] = c.fetchone()[0]
     c.execute('SELECT COUNT(*) FROM workers') 
     result['worker_count'] = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM workers where LastAliveTime> datetime('now', '-10 minute')")
+    result['worker_count_last_10_minutes'] = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM workers where LastAliveTime> datetime('now', '-1 hour')")
     result['worker_count_last_hour'] = c.fetchone()[0]
+    result['projected_hours_remaining_10_min_base'] = (result['batches_remaining']/(result['batches_completed_last_10_minutes']*6))/result['worker_count_last_10_minutes']
+    result['projected_hours_remaining_1_hour_base'] = (result['batches_remaining']/(result['batches_completed_last_hour']))/result['worker_count_last_hour']
     return json.dumps(result)
     
     
@@ -339,7 +351,6 @@ def wake_registration():
     return Response('OK', mimetype='text/plain')
 
 @app.route('/internal/purgeinactive')
-@cache.cached(timeout=30)
 def request_reopen():
     return reopenavailability()
 
