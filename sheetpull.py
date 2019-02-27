@@ -212,7 +212,9 @@ def gen_stats():
     result['batches_remaining'] = c.fetchone()[0]
     c.execute('SELECT count(*) FROM main')
     result['batches_total'] = c.fetchone()[0]
-    #result['projected_hours_remaining'] = (result['average_batch_time_seconds'] * result['batches_remaining'])/3600
+    result['projected_hours_remaining'] = (result['average_batch_time_seconds']* result['batches_remaining'])/3600
+    result['projected_hours_remaining_10_min_base'] = result['batches_remaining']/(result['batches_completed_last_10_minutes']*6)
+    result['projected_hours_remaining_1_hour_base'] = result['batches_remaining']/(result['batches_completed_last_hour'])
     result['batches_completed_percent'] = (result['batches_completed']/result['batches_total'])*100
     c.execute('SELECT COUNT(*) from domains')
     result['total_custom_domains'] = c.fetchone()[0]
@@ -232,8 +234,12 @@ def gen_stats():
     result['worker_count_last_10_minutes'] = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM workers where LastAliveTime> datetime('now', '-1 hour')")
     result['worker_count_last_hour'] = c.fetchone()[0]
-    result['projected_hours_remaining_10_min_base'] = (result['batches_remaining']/(result['batches_completed_last_10_minutes']*6))/result['worker_count_last_10_minutes']
-    result['projected_hours_remaining_1_hour_base'] = (result['batches_remaining']/(result['batches_completed_last_hour']))/result['worker_count_last_hour']
+c.execute('SELECT COUNT(DISTINCT LastAliveIP) FROM workers') 
+    result['worker_id_count'] = c.fetchone()[0]
+    c.execute("SELECT COUNT(DISTINCT LastAliveIP) FROM workers where LastAliveTime> datetime('now', '-10 minute')")
+    result['worker_id_count_last_10_minutes'] = c.fetchone()[0]
+    c.execute("SELECT COUNT(DISTINCT LastAliveIP) FROM workers where LastAliveTime> datetime('now', '-1 hour')")
+    result['worker_id_count_last_hour'] = c.fetchone()[0]
     return json.dumps(result)
     
     
