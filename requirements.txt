@@ -2,7 +2,6 @@ requests
 pydrive
 flask
 gunicorn
-heroku3
 Flask-Caching
 hurry.filesize
 fasteners
