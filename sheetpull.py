@@ -1,4 +1,4 @@
-import os, time, datetime, random, json, sqlite3, signal, uuid, csv, requests, pydrive, flask, heroku3, fasteners
+import os, time, datetime, random, json, sqlite3, signal, uuid, csv, requests, pydrive, flask, fasteners
 from time import sleep
 
 from hurry.filesize import size, alternative
@@ -31,24 +31,24 @@ reader = csv.reader(infile)
 offsets = dict((rows[0],rows[1]) for rows in reader)
 infile.close()
 
-mysf = drive.CreateFile({'id': '1U27xcHSk91JXj2-1TVvoVpBJq3HQDLvt'})
-mysf.GetContentFile('domains_list.txt')
+#mysf = drive.CreateFile({'id': '1U27xcHSk91JXj2-1TVvoVpBJq3HQDLvt'})
+#mysf.GetContentFile('domains_list.txt')
 
-sleep(15) #Safety cushion
+#sleep(15) #Safety cushion
 
-a_lock = fasteners.InterProcessLock('tmp_lock_file_init')
-gotten = a_lock.acquire(blocking=False)
-if gotten and (not os.path.exists('db.db')):
-    print('Gotten lock')
+#a_lock = fasteners.InterProcessLock('tmp_lock_file_init')
+#gotten = a_lock.acquire(blocking=False)
+#if gotten and (not os.path.exists('db.db')):
+#    print('Gotten lock')
     #DL the DB
-    mysf = drive.CreateFile({'id': str(heroku3.from_key(os.environ['heroku-key']).apps()['getblogspot-01'].config()['dbid'])})
-    mysf.GetContentFile('db.db')
-    del mysf
-    a_lock.release()
-    print('Loaded DB')
-else:
-    sleep(7)
-    print('T2 up')
+#    mysf = drive.CreateFile({'id': str(heroku3.from_key(os.environ['heroku-key']).apps()['getblogspot-01'].config()['dbid'])})
+#    mysf.GetContentFile('db.db')
+#    del mysf
+#    a_lock.release()
+#    print('Loaded DB')
+#else:
+#    sleep(7)
+#    print('T2 up')
     #print('Waiting for lock to finish...')
     #gotten = a_lock.acquire()
     #print('DB Done')
@@ -79,8 +79,8 @@ class GracefulKiller:
     def exit_gracefully(self,signum, frame):
         self.kill_now = True
         sleep(3)
-        #if os.path.exists("backup.db"):
-        #  os.remove("backup.db")
+        #if os.path.exists("backup_quit.db"):
+        #  os.remove("backup_quit.db")
         #else:
         #  print("The file does not exist")
         a_lock = fasteners.InterProcessLock('tmp_lock_file')
@@ -89,11 +89,11 @@ class GracefulKiller:
             print('Gotten lock')
             with sqlite3.connect('backup_quit.db') as bck:
                 conn.backup(bck)#, pages=1, progress=progress)
-            myul = drive.CreateFile({'title': 'db.db'})
-            myul.SetContentFile('backup_quit.db')
-            myul.Upload()
-            heroku3.from_key(os.environ['heroku-key']).apps()['getblogspot-01'].config()['dbid'] = myul['id']
-            del myul
+            #myul = drive.CreateFile({'title': 'db.db'})
+            #myul.SetContentFile('backup_quit.db')
+            #myul.Upload()
+            #heroku3.from_key(os.environ['heroku-key']).apps()['getblogspot-01'].config()['dbid'] = myul['id']
+            #del myul
             a_lock.release()
         print('Exiting...')    
         exit()
@@ -212,10 +212,6 @@ def gen_stats():
     result['batches_remaining'] = c.fetchone()[0]
     c.execute('SELECT count(*) FROM main')
     result['batches_total'] = c.fetchone()[0]
-    result['projected_hours_remaining'] = (result['average_batch_time_seconds']* result['batches_remaining'])/3600
-    result['projected_hours_remaining_10_min_base'] = result['batches_remaining']/(result['batches_completed_last_10_minutes']*6)
-    result['projected_hours_remaining_1_hour_base'] = result['batches_remaining']/(result['batches_completed_last_hour'])
-    result['batches_completed_percent'] = (result['batches_completed']/result['batches_total'])*100
     c.execute('SELECT COUNT(*) from domains')
     result['total_custom_domains'] = c.fetchone()[0]
     c.execute('SELECT sum(BatchSize) FROM main')
@@ -228,6 +224,10 @@ def gen_stats():
     result['total_data_size_pretty'] = size(result['total_data_size'], system=alternative)
     c.execute('SELECT count(BatchContent) FROM main')
     result['total_exclusions'] = c.fetchone()[0]
+    result['batches_completed_percent'] = (result['batches_completed']/(result['batches_total']-(0.9*result['batches_remaining'])))*100
+    result['projected_hours_remaining'] = (result['average_batch_time_seconds'] * (result['batches_remaining']-(0.9*result['total_exclusions'])))/3600
+    result['projected_hours_remaining_10_min_base'] = (result['batches_remaining']-(0.9*result['total_exclusions']))/(result['batches_completed_last_10_minutes']*6)
+    result['projected_hours_remaining_1_hour_base'] = (result['batches_remaining']-(0.9*result['total_exclusions']))/(result['batches_completed_last_hour'])
     c.execute('SELECT COUNT(*) FROM workers') 
     result['worker_count'] = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM workers where LastAliveTime> datetime('now', '-10 minute')")
@@ -245,13 +245,13 @@ def gen_stats():
     
 @app.route('/worker/getID')
 def give_id():
-    ip = request.headers['X-Forwarded-For']
+    ip = request.remote_addr
     return str(addworker(ip))
 
 @app.route('/worker/getBatch') #Parameters: id
 def give_batch():
     id = str(request.args.get('id', ''))
-    ip = request.headers['X-Forwarded-For']
+    ip = request.remote_addr
     workeralive(id, ip)
     if not getworkers(id):
         return 'Fail'
@@ -266,7 +266,7 @@ def submit_exclusion(): #Parameters: id, batchID, randomKey, exclusion
     batchid = request.args.get('batchID', '')
     randomkey = request.args.get('randomKey', '')
     target = request.args.get('exclusion', '')
-    ip = request.headers['X-Forwarded-For']
+    ip = request.remote_addr
     if not verifylegitrequest(id, batchid, randomkey, ip):
         return 'Fail'
     if not target:
@@ -279,7 +279,7 @@ def submit_deleted(): #Parameters: id, batchID, randomKey, deleted
     batchid = request.args.get('batchID', '')
     randomkey = request.args.get('randomKey', '')
     target = request.args.get('deleted', '')
-    ip = request.headers['X-Forwarded-For']
+    ip = request.remote_addr
     if not verifylegitrequest(id, batchid, randomkey, ip):
         return 'Fail'
     if not target:
@@ -292,7 +292,7 @@ def submit_private(): #Parameters: id, batchID, randomKey, private
     batchid = request.args.get('batchID', '')
     randomkey = request.args.get('randomKey', '')
     target = request.args.get('private', '')
-    ip = request.headers['X-Forwarded-For']
+    ip = request.remote_addr
     if not verifylegitrequest(id, batchid, randomkey, ip):
         return 'Fail'
     if not target:
@@ -306,7 +306,7 @@ def submit_domain(): #Parameters: id, batchID, randomKey, blog, domain
     randomkey = request.args.get('randomKey', '')
     target = request.args.get('blog', '')
     customdomain = request.args.get('domain', '')
-    ip = request.headers['X-Forwarded-For']
+    ip = request.remote_addr
     if not verifylegitrequest(id, batchid, randomkey, ip):
         return 'Fail'
     if not target:
@@ -321,7 +321,7 @@ def update_status(): #Parameters: id, batchID, randomKey, status ('a'=assigned,)
     batchid = request.args.get('batchID', '')
     randomkey = request.args.get('randomKey', '')
     status = request.args.get('status', '')
-    ip = request.headers['X-Forwarded-For']
+    ip = request.remote_addr
     if not verifylegitrequest(id, batchid, randomkey, ip):
         return 'Fail'
     if not status in ['c', 'f']: #valid submission
