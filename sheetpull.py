@@ -11,6 +11,11 @@ from threading import Lock
 #Mutex lock used to prevent different workers getting the same batch id
 assignBatchLock = Lock()
 
+drive_lock = fasteners.InterProcessLock('/dev/shm/drive_lock_file')
+print('Requesting lock')
+gotten = drive_lock.acquire(blocking=True)
+print('Got lock')
+
 #AUTH to Google Drive
 gauth = GoogleAuth()
 
@@ -26,12 +31,14 @@ gauth.SaveCredentialsFile("credentials.txt")
 
 drive = GoogleDrive(gauth)
 
-infile = open('offset.csv', mode='r')
-reader = csv.reader(infile)
-offsets = dict((rows[0],rows[1]) for rows in reader)
-infile.close()
+drive_lock.release()
 
-#mysf = drive.CreateFile({'id': '1U27xcHSk91JXj2-1TVvoVpBJq3HQDLvt'})
+#infile = open('offset.csv', mode='r')
+#reader = csv.reader(infile)
+#offsets = dict((rows[0],rows[1]) for rows in reader)
+#infile.close()
+
+#mysf = drive.CreateFile({'id': '[id of file to be used]'})
 #mysf.GetContentFile('domains_list.txt')
 
 #sleep(15) #Safety cushion
@@ -62,7 +69,7 @@ app = Flask(__name__)
 cache = Cache(app,config={'CACHE_TYPE': 'simple'})
 
 #DB Inititalization
-conn = sqlite3.connect('db.db')
+conn = sqlite3.connect('/dev/shm/dbfile.db')
 conn.isolation_level= None # turn on autocommit to increase concurency
 c = conn.cursor()
 
@@ -104,9 +111,11 @@ def getworkers(id):
     c.execute('select count(WorkerID ) from workers where WorkerID =?', (id,))
     return c.fetchone()[0]>0 
 
-def addworker(ip):
+def addworker(ip, ver):
+    if ver == '':
+	    ver = 0
     desid = str(uuid.uuid5(uuid.NAMESPACE_URL, str(random.random())+str(random.random())+str(random.random())))#random.randint(1, 100000)#(myr[-1][0])+1
-    c.execute('INSERT INTO "main"."workers"("WorkerID","CreatedTime","LastAliveTime","LastAliveIP") VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)', (desid,ip))
+    c.execute('INSERT INTO "main"."workers"("WorkerID","CreatedTime","LastAliveTime","LastAliveIP","WorkerVersion") VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?)', (desid,ip,ver,))
     complete = True
     return desid
 
@@ -114,29 +123,58 @@ def workeralive(id, ip):
     c.execute('UPDATE workers SET LastAliveTime=CURRENT_TIMESTAMP, LastAliveIP=? WHERE WorkerID=?', (ip, str(id),))
     return
 
-def assignBatch(id, ip):
-    #reopenavailability()
-    limit = 450
+def assignBatch(id, ip, ver):
+    if ver == '':
+	    ver = 0
+    limit = 300#100#80#250#450
     batchsize = 250
-    randomkey = random.randint(1, 10000)
-    #Mutex lock used to prevent different workers getting the same batch id
-    with assignBatchLock:
-                          #only one thread can execute here
-        c.execute('SELECT BatchID, BatchContent from main where BatchStatus=0 LIMIT 1')
-        datalist = c.fetchone()
-        ans = datalist[0]
-        if datalist[1]:
-            dltype = "domain"
-            content = datalist[1]
-        else:
-            dltype = "list"
-            content = ""
-        myoffset = offsets[str(ans)]
-        if not ans:
-            return "Fail", "Fail", "Fail", "Fail", "Fail", "Fail", "Fail"
-        c.execute('UPDATE main SET BatchStatus=1, WorkerKey=?, RandomKey=?, AssignedTime=CURRENT_TIMESTAMP, BatchStatusUpdateTime=CURRENT_TIMESTAMP, BatchStatusUpdateIP=? WHERE BatchID=?',(id,randomkey,ip,ans))
-    return ans, randomkey, myoffset, limit, dltype, content, batchsize
-
+    batch_lock = fasteners.InterProcessLock('/dev/shm/batchassign_lock_file')
+    print('Requesting lock')
+    gotten = batch_lock.acquire(blocking=True)
+    print('Got lock')
+    try:
+        #reopenavailability()
+        #Mutex lock used to prevent different workers getting the same batch id
+        with assignBatchLock:
+                              #only one thread can execute here
+            if int(ver) != 0: #newer versions
+                c.execute('SELECT BatchID, BatchContent, RandomKey from main where BatchStatus=0 AND BatchContent IS NULL LIMIT 1')
+                datalist = c.fetchone()
+                if datalist == None:
+                    c.execute('SELECT BatchID, BatchContent, RandomKey from main where BatchStatus=0 LIMIT 1')
+                    datalist = c.fetchone()
+            else: #old versions, exclusions only
+                c.execute('SELECT BatchID, BatchContent, RandomKey from main where BatchStatus=0 AND BatchContent IS NOT NULL LIMIT 1')
+                datalist = c.fetchone()
+            if datalist == None:
+                print('Releasing')
+                batch_lock.release()
+                return "Fail", "Fail", "Fail", "Fail", "Fail", "Fail", "Fail"
+            ans = datalist[0]
+            if datalist[2]:
+                randomkey = datalist[2]
+            else:
+                randomkey = '2-'+str(random.randint(1, 10000000))
+            c.execute('UPDATE main SET BatchStatus=1, WorkerKey=?, RandomKey=?, AssignedTime=CURRENT_TIMESTAMP, BatchStatusUpdateTime=CURRENT_TIMESTAMP, BatchStatusUpdateIP=? WHERE BatchID=?',(id,randomkey,ip,ans))
+            print('Releasing')
+            batch_lock.release()
+            myoffset=0
+            if datalist[1]:
+                dltype = "domain"
+                content = datalist[1]
+                limit = 0
+                batchsize = 1
+            else:
+                dltype = "list"
+                c.execute('SELECT BatchContent from batches where BatchID=?', (ans,))
+                content = str(c.fetchone()[0]).replace('\n', '')
+                myoffset = 0#offsets[str(ans)]
+        return ans, randomkey, myoffset, limit, dltype, content, batchsize
+    except:
+        print('Releasing')
+        batch_lock.release()
+        raise
+        
 def addtolist(list, id, batch, randomkey, item):
     item = item.lower()
     c.execute('SELECT '+str(list)+' FROM main WHERE BatchID=?', (str(batch),))
@@ -198,8 +236,13 @@ def reopenavailability():
 
 def gen_stats():
     result = {}
-    c.execute("select avg(strftime('%s',BatchStatusUpdateTime) -strftime('%s',AssignedTime) ) from main where  BatchStatus=2")
+    c.execute("select avg(strftime('%s',BatchStatusUpdateTime) -strftime('%s',AssignedTime) ) from main where BatchStatus=2")
     result['average_batch_time_seconds'] = c.fetchone()[0]
+    c.execute("select avg(strftime('%s',BatchStatusUpdateTime) -strftime('%s',AssignedTime) ) from main where BatchStatus=2 AND BatchContent IS NULL")
+    result['average_nonexclusion_batch_time_seconds'] = c.fetchone()[0]
+    c.execute("select avg(strftime('%s',BatchStatusUpdateTime) -strftime('%s',AssignedTime) ) from main where BatchStatus=2 AND BatchContent IS NOT NULL")
+    result['average_exclusion_batch_time_seconds'] = c.fetchone()[0]
+    
     c.execute('SELECT count(*) FROM main WHERE BatchStatus=1')
     result['batches_assigned'] = c.fetchone()[0]
     c.execute('SELECT count(*) FROM main WHERE BatchStatus=2')
@@ -208,11 +251,36 @@ def gen_stats():
     result['batches_completed_last_10_minutes'] = c.fetchone()[0]
     c.execute("SELECT count(*) FROM main WHERE BatchStatusUpdateTime> datetime('now', '-1 hour') and BatchStatus=2")
     result['batches_completed_last_hour'] = c.fetchone()[0]
+    
+    c.execute('SELECT count(*) FROM main WHERE BatchContent IS NULL AND BatchStatus=1')
+    result['nonexclusion_batches_assigned'] = c.fetchone()[0]
+    c.execute('SELECT count(*) FROM main WHERE BatchContent IS NULL AND BatchStatus=2')
+    result['nonexclusion_batches_completed'] = c.fetchone()[0]
+    c.execute("SELECT count(*) FROM main WHERE BatchContent IS NULL AND BatchStatusUpdateTime> datetime('now', '-10 minute') and BatchStatus=2")
+    result['nonexclusion_batches_completed_last_10_minutes'] = c.fetchone()[0]
+    c.execute("SELECT count(*) FROM main WHERE BatchContent IS NULL AND BatchStatusUpdateTime> datetime('now', '-1 hour') and BatchStatus=2")
+    result['nonexclusion_batches_completed_last_hour'] = c.fetchone()[0]
+    c.execute('SELECT count(*) FROM main WHERE BatchContent IS NULL AND (BatchStatus=0 OR BatchStatus=1)')
+    result['nonexclusion_batches_remaining'] = c.fetchone()[0]
+    c.execute('SELECT count(*) FROM main WHERE BatchContent IS NULL')
+    result['nonexclusion_batches_total'] = c.fetchone()[0]
+    result['nonexclusion_batches_completed_percent'] = (result['nonexclusion_batches_completed']/(result['nonexclusion_batches_total']))*100
+    try:
+        result['nonexclusion_projected_hours_remaining_10_min_base'] = (result['nonexclusion_batches_remaining'])/(result['nonexclusion_batches_completed_last_10_minutes']*6)
+    except ZeroDivisionError:
+        result['nonexclusion_projected_hours_remaining_10_min_base'] = None
+    try:
+        result['nonexclusion_projected_hours_remaining_1_hour_base'] = (result['nonexclusion_batches_remaining'])/(result['nonexclusion_batches_completed_last_hour'])
+        result['nonexclusion_projected_hours_remaining'] = result['nonexclusion_projected_hours_remaining_1_hour_base'] #(result['average_batch_time_seconds'] * (result['nonexclusion_batches_remaining']-(0.9*result['total_exclusions'])))/3600
+    except ZeroDivisionError:
+        result['nonexclusion_projected_hours_remaining_1_hour_base'] = None
+        result['nonexclusion_projected_hours_remaining'] = None
+    
     c.execute("SELECT count(BatchContent) FROM main WHERE BatchStatusUpdateTime> datetime('now', '-10 minute') and BatchStatus=2")
     result['exclusions_completed_last_10_minutes'] = c.fetchone()[0]
     c.execute("SELECT count(BatchContent) FROM main WHERE BatchStatusUpdateTime> datetime('now', '-1 hour') and BatchStatus=2")
     result['exclusions_completed_last_hour'] = c.fetchone()[0]
-    c.execute('SELECT count(*) FROM main WHERE BatchStatus=0')
+    c.execute('SELECT count(*) FROM main WHERE (BatchStatus=0 OR BatchStatus=1)')
     result['batches_remaining'] = c.fetchone()[0]
     c.execute('SELECT count(*) FROM main')
     result['batches_total'] = c.fetchone()[0]
@@ -230,16 +298,60 @@ def gen_stats():
     result['total_exclusions'] = c.fetchone()[0]
     c.execute('SELECT count(BatchContent) FROM main where BatchStatus=0')
     result['exclusions_unassigned'] = c.fetchone()[0]
-    result['batches_completed_percent'] = (result['batches_completed']/(result['batches_total']-(0.9*result['total_exclusions'])))*100
-    result['projected_hours_remaining_10_min_base'] = (result['batches_remaining']-(0.9*result['exclusions_unassigned']))/(result['batches_completed_last_10_minutes']*6)
-    result['projected_hours_remaining_1_hour_base'] = (result['batches_remaining']-(0.9*result['exclusions_unassigned']))/(result['batches_completed_last_hour'])
-    result['projected_hours_remaining'] = result['projected_hours_remaining_1_hour_base'] #(result['average_batch_time_seconds'] * (result['batches_remaining']-(0.9*result['total_exclusions'])))/3600
+    
+    c.execute('SELECT count(BatchContent) FROM main where BatchStatus=2')
+    result['exclusions_completed'] = c.fetchone()[0]
+    
+    try:
+        result['exclusion_projected_hours_remaining_10_min_base'] = (result['exclusions_unassigned'])/(result['exclusions_completed_last_10_minutes']*6)
+    except ZeroDivisionError:
+        result['exclusion_projected_hours_remaining_10_min_base'] = None
+    try:
+        result['exclusion_projected_hours_remaining_1_hour_base'] = (result['exclusions_unassigned'])/(result['exclusions_completed_last_hour'])
+        result['exclusion_projected_hours_remaining'] = result['exclusion_projected_hours_remaining_1_hour_base'] #(result['average_batch_time_seconds'] * (result['exclusion_batches_remaining']-(0.9*result['total_exclusions'])))/3600
+    except ZeroDivisionError:
+        result['exclusion_projected_hours_remaining_1_hour_base'] = None
+        result['exclusion_projected_hours_remaining'] = None
+    
+    result['exclusion_batches_completed_percent'] = (result['exclusions_completed']/(result['total_exclusions']))*100
+    
+    result['batches_completed_percent'] = (result['batches_completed']/(result['batches_total']))*100 #-(0.9*result['total_exclusions'])))*100
+    
+    # try:
+        # result['projected_hours_remaining_10_min_base'] = 
+    # except:
+        # result['projected_hours_remaining_10_min_base'] = None
+    # try:
+        # result['projected_hours_remaining_1_hour_base'] = 
+        # result['projected_hours_remaining'] = result['projected_hours_remaining_1_hour_base'] #(result['average_batch_time_seconds'] * (result['batches_remaining']-(0.9*result['total_exclusions'])))/3600
+    # except:
+        # result['projected_hours_remaining_1_hour_base'] = None
+        # result['projected_hours_remaining'] = None
+        
+    try:
+        result['projected_hours_remaining_10_min_base'] = (result['batches_remaining'])/(result['batches_completed_last_10_minutes']*6)
+    except ZeroDivisionError:
+        result['projected_hours_remaining_10_min_base'] = None
+    try:
+        result['projected_hours_remaining_1_hour_base'] = (result['batches_remaining'])/(result['batches_completed_last_hour'])
+        #result['projected_hours_remaining'] = result['projected_hours_remaining_1_hour_base'] #(result['average_batch_time_seconds'] * (result['batches_remaining']-(0.9*result['total_exclusions'])))/3600
+    except ZeroDivisionError:
+        result['projected_hours_remaining_1_hour_base'] = None
+        #result['projected_hours_remaining'] = None
+    
+    result['projected_hours_remaining'] = ((result['average_exclusion_batch_time_seconds'] * result['exclusions_unassigned']) + (result['average_nonexclusion_batch_time_seconds'] * result['nonexclusion_batches_remaining']))/3600
+    
     c.execute('SELECT COUNT(*) FROM workers') 
     result['worker_count'] = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM workers where LastAliveTime> datetime('now', '-10 minute')")
     result['worker_count_last_10_minutes'] = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM workers where LastAliveTime> datetime('now', '-1 hour')")
     result['worker_count_last_hour'] = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM workers where LastAliveTime> datetime('now', '-1 hour') AND WorkerVersion=4")
+    result['version_4_workers_last_hour'] = c.fetchone()[0]
+    result['percent_version_4_workers_last_hour'] = (result['version_4_workers_last_hour']/result['worker_count_last_hour'])*100
+    
     c.execute('SELECT COUNT(DISTINCT LastAliveIP) FROM workers') 
     result['worker_ip_count'] = c.fetchone()[0]
     c.execute("SELECT COUNT(DISTINCT LastAliveIP) FROM workers where LastAliveTime> datetime('now', '-10 minute')")
@@ -252,16 +364,19 @@ def gen_stats():
 @app.route('/worker/getID')
 def give_id():
     ip = request.remote_addr
-    return str(addworker(ip))
+    ver = str(request.args.get('worker_version', ''))
+    return str(addworker(ip, ver))
 
 @app.route('/worker/getBatch') #Parameters: id
 def give_batch():
     id = str(request.args.get('id', ''))
+    ver = str(request.args.get('worker_version', ''))
+    #print(ver)
     ip = request.remote_addr
     workeralive(id, ip)
     if not getworkers(id):
         return 'Fail'
-    batchid, randomkey, curroffset, limit, dltype, content, batchsize = assignBatch(id, ip)
+    batchid, randomkey, curroffset, limit, dltype, content, batchsize = assignBatch(id, ip, ver)
     myj = {'batchID': batchid, 'randomKey': str(randomkey), 'offset': curroffset, 'limit': limit, 'assignmentType': dltype, 'content': content, 'batchSize': batchsize}
     myresp = Response(json.dumps(myj), mimetype='application/json')
     return myresp
@@ -281,29 +396,31 @@ def submit_exclusion(): #Parameters: id, batchID, randomKey, exclusion
 
 @app.route('/worker/submitDeleted')
 def submit_deleted(): #Parameters: id, batchID, randomKey, deleted
-    id = request.args.get('id', '')
-    batchid = request.args.get('batchID', '')
-    randomkey = request.args.get('randomKey', '')
-    target = request.args.get('deleted', '')
-    ip = request.remote_addr
-    if not verifylegitrequest(id, batchid, randomkey, ip):
-        return 'Fail'
-    if not target:
-        return 'Fail'
-    return(addtolist("Deleted", id, batchid, randomkey, target))
+    return 'Success'
+    # id = request.args.get('id', '')
+    # batchid = request.args.get('batchID', '')
+    # randomkey = request.args.get('randomKey', '')
+    # target = request.args.get('deleted', '')
+    # ip = request.remote_addr
+    # if not verifylegitrequest(id, batchid, randomkey, ip):
+        # return 'Fail'
+    # if not target:
+        # return 'Fail'
+    # return(addtolist("Deleted", id, batchid, randomkey, target))
 
 @app.route('/worker/submitPrivate')
 def submit_private(): #Parameters: id, batchID, randomKey, private
-    id = request.args.get('id', '')
-    batchid = request.args.get('batchID', '')
-    randomkey = request.args.get('randomKey', '')
-    target = request.args.get('private', '')
-    ip = request.remote_addr
-    if not verifylegitrequest(id, batchid, randomkey, ip):
-        return 'Fail'
-    if not target:
-        return 'Fail'
-    return(addtolist("Privated", id, batchid, randomkey, target))
+    return 'Success'
+    # id = request.args.get('id', '')
+    # batchid = request.args.get('batchID', '')
+    # randomkey = request.args.get('randomKey', '')
+    # target = request.args.get('private', '')
+    # ip = request.remote_addr
+    # if not verifylegitrequest(id, batchid, randomkey, ip):
+        # return 'Fail'
+    # if not target:
+        # return 'Fail'
+    # return(addtolist("Privated", id, batchid, randomkey, target))
 
 @app.route('/worker/submitDomain')
 def submit_domain(): #Parameters: id, batchID, randomKey, blog, domain
@@ -344,6 +461,10 @@ def get_stats():
 def download_list():
     return flask.send_file("domains_list.txt", mimetype='text/plain', as_attachment=True)
 
+@app.route('/worker/domains.txt.gz')
+def download_list_gz():
+    return flask.send_file("domains_list.txt.gz", mimetype='text/plain', as_attachment=True)
+
 @app.route('/internal/dumpdb')
 @cache.cached(timeout=300)
 def dumpdb():
@@ -352,7 +473,7 @@ def dumpdb():
     #else:
     #    print("The file does not exist")
     with sqlite3.connect('backup.db') as bck:
-        conn.backup(bck)#, pages=1, progress=progress)
+        conn.backup(bck, pages=1)#, pages=1, progress=progress)
     myul = drive.CreateFile({'title': 'dbDUMP.db'})
     myul.SetContentFile('backup.db')
     myul.Upload()
